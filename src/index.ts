@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer as createHttpServer } from "node:http";
+import { loadBearerAuth } from "./auth.js";
 import { Cache } from "./cache.js";
 import { EspnClient } from "./espn/client.js";
 import { loadRegistry } from "./registry/sports.js";
@@ -115,6 +116,15 @@ async function main() {
   // Streamable HTTP, stateless: a fresh server + transport per request.
   const port = Number(process.env.PORT ?? 3000);
   const host = process.env.HOST ?? "127.0.0.1";
+  const auth = loadBearerAuth();
+
+  const loopback = host === "127.0.0.1" || host === "::1" || host === "localhost";
+  if (!auth.enabled && !loopback && process.env.MCP_ALLOW_UNAUTHENTICATED !== "true") {
+    throw new Error(
+      `Refusing to listen on ${host} without authentication. Set MCP_AUTH_TOKENS ` +
+        `or MCP_AUTH_TOKEN_FILE, or MCP_ALLOW_UNAUTHENTICATED=true to override.`
+    );
+  }
 
   const http = createHttpServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
@@ -124,6 +134,12 @@ async function main() {
     }
     if (url.pathname !== "/mcp") {
       res.writeHead(404).end();
+      return;
+    }
+    if (!auth.check(req)) {
+      res
+        .writeHead(401, { "WWW-Authenticate": 'Bearer realm="espn-mcp"' })
+        .end("Unauthorized");
       return;
     }
     if (req.method !== "POST") {
@@ -158,8 +174,16 @@ async function main() {
   });
 
   http.listen(port, host, () => {
-    console.error(`ESPN MCP server listening on http://${host}:${port}/mcp`);
+    console.error(
+      `ESPN MCP server listening on http://${host}:${port}/mcp ` +
+        `(bearer auth ${auth.enabled ? "enabled" : "DISABLED"})`
+    );
   });
+
+  // Exit cleanly on `docker stop` / Ctrl-C.
+  for (const signal of ["SIGTERM", "SIGINT"] as const) {
+    process.on(signal, () => http.close(() => process.exit(0)));
+  }
 }
 
 main().catch((err) => {
